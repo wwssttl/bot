@@ -2,7 +2,7 @@ import logging
 import subprocess
 import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, CallbackContext, filters
 
 # Замените на токен вашего бота
 TOKEN = "8137824543:AAGKP32Rjj_ctA5horpEVoKOezJSBNhsRfg"
@@ -190,7 +190,7 @@ def main():
 
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CallbackQueryHandler(button))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     updater.start_polling()
     updater.idle()
