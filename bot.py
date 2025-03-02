@@ -2,15 +2,13 @@ import logging
 import subprocess
 import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, CallbackContext, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 # Замените на токен вашего бота
 TOKEN = "8137824543:AAGKP32Rjj_ctA5horpEVoKOezJSBNhsRfg"
-
 # Укажите MAC-адрес для отправки WOL (если требуется)
 WOL_MAC = "b0:6e:bf:c8:3e:ba"  # замените на нужный MAC
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
 )
@@ -67,87 +65,85 @@ def apps_menu():
     return InlineKeyboardMarkup(keyboard)
 
 # Обработчик команды /start
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Главное меню:", reply_markup=main_menu())
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Главное меню:", reply_markup=main_menu())
 
 # Обработчик callback-запросов от кнопок
-def button(update: Update, context: CallbackContext):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    query.answer()
+    await query.answer()
     data = query.data
 
     if data == 'menu_audio':
-        query.edit_message_text(text="Меню аудио:", reply_markup=audio_menu())
+        await query.edit_message_text(text="Меню аудио:", reply_markup=audio_menu())
     elif data == 'audio_playpause':
         try:
             subprocess.run("playerctl play-pause", shell=True)
-            query.answer(text="Команда Play/Pause выполнена")
+            await query.answer(text="Команда Play/Pause выполнена")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'audio_next':
         try:
             subprocess.run("playerctl next", shell=True)
-            query.answer(text="Следующий трек")
+            await query.answer(text="Следующий трек")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'audio_prev':
         try:
             subprocess.run("playerctl previous", shell=True)
-            query.answer(text="Предыдущий трек")
+            await query.answer(text="Предыдущий трек")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'audio_volume':
-        query.edit_message_text(text="Выберите уровень громкости:", reply_markup=volume_menu())
+        await query.edit_message_text(text="Выберите уровень громкости:", reply_markup=volume_menu())
     elif data.startswith('audio_volume_'):
-        vol = data.split('_')[-1]  # извлекаем число, например "25", "50" и т.д.
+        vol = data.split('_')[-1]  # Получаем значение громкости, например "25", "50" и т.д.
         try:
             subprocess.run(f"amixer sset Master {vol}%", shell=True)
-            query.answer(text=f"Громкость установлена на {vol}%")
+            await query.answer(text=f"Громкость установлена на {vol}%")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'back_audio':
-        query.edit_message_text(text="Меню аудио:", reply_markup=audio_menu())
+        await query.edit_message_text(text="Меню аудио:", reply_markup=audio_menu())
     elif data == 'menu_power':
-        query.edit_message_text(text="Меню питания:", reply_markup=power_menu())
+        await query.edit_message_text(text="Меню питания:", reply_markup=power_menu())
     elif data == 'power_reboot':
         try:
             subprocess.run("reboot", shell=True)
-            query.answer(text="Перезагрузка")
+            await query.answer(text="Перезагрузка")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'power_shutdown':
         try:
             subprocess.run("shutdown now", shell=True)
-            query.answer(text="Выключение")
+            await query.answer(text="Выключение")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'power_sleep':
         try:
             subprocess.run("systemctl suspend", shell=True)
-            query.answer(text="Переход в спящий режим")
+            await query.answer(text="Переход в спящий режим")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'power_wol':
         try:
             subprocess.run(f"wakeonlan {WOL_MAC}", shell=True)
-            query.answer(text="WOL пакет отправлен")
+            await query.answer(text="WOL пакет отправлен")
         except Exception as e:
-            query.answer(text=f"Ошибка: {e}")
+            await query.answer(text=f"Ошибка: {e}")
     elif data == 'menu_apps':
-        query.edit_message_text(text="Меню приложений:", reply_markup=apps_menu())
+        await query.edit_message_text(text="Меню приложений:", reply_markup=apps_menu())
     elif data == 'apps_open':
         context.user_data['action'] = 'open'
-        query.edit_message_text(text="Отправьте название или команду для открытия приложения:")
+        await query.edit_message_text(text="Отправьте название или команду для открытия приложения:")
     elif data == 'apps_close':
         context.user_data['action'] = 'close'
-        query.edit_message_text(text="Отправьте название или команду для закрытия приложения:")
+        await query.edit_message_text(text="Отправьте название или команду для закрытия приложения:")
     elif data == 'menu_monitor':
-        # Сбор системной информации
         cpu_usage = psutil.cpu_percent(interval=1)
         mem = psutil.virtual_memory()
         mem_used = mem.used / (1024**3)
         mem_total = mem.total / (1024**3)
-        # Попытка получить информацию по GPU (если установлена nvidia-smi)
         try:
             result = subprocess.run("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits",
                                       shell=True, capture_output=True, text=True)
@@ -158,42 +154,38 @@ def button(update: Update, context: CallbackContext):
                 f"CPU: {cpu_usage}%\n"
                 f"GPU: {gpu_usage}\n"
                 f"Память: {mem_used:.2f}GB / {mem_total:.2f}GB")
-        query.edit_message_text(text=text, reply_markup=main_menu())
+        await query.edit_message_text(text=text, reply_markup=main_menu())
     elif data == 'back_main':
-        query.edit_message_text(text="Главное меню:", reply_markup=main_menu())
+        await query.edit_message_text(text="Главное меню:", reply_markup=main_menu())
 
-# Обработчик текстовых сообщений (используется для управления приложениями)
-def handle_message(update: Update, context: CallbackContext):
+# Обработчик текстовых сообщений для управления приложениями
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'action' in context.user_data:
         action = context.user_data.pop('action')
         app_command = update.message.text.strip()
         if action == 'open':
             try:
-                # Запуск приложения (в фоне)
                 subprocess.Popen(app_command, shell=True)
-                update.message.reply_text(f"Запуск: {app_command}", reply_markup=main_menu())
+                await update.message.reply_text(f"Запуск: {app_command}", reply_markup=main_menu())
             except Exception as e:
-                update.message.reply_text(f"Ошибка при запуске: {e}", reply_markup=main_menu())
+                await update.message.reply_text(f"Ошибка при запуске: {e}", reply_markup=main_menu())
         elif action == 'close':
             try:
-                # Завершение приложения по названию/команде
                 subprocess.run(f"pkill -f '{app_command}'", shell=True)
-                update.message.reply_text(f"Закрытие: {app_command}", reply_markup=main_menu())
+                await update.message.reply_text(f"Закрытие: {app_command}", reply_markup=main_menu())
             except Exception as e:
-                update.message.reply_text(f"Ошибка при закрытии: {e}", reply_markup=main_menu())
+                await update.message.reply_text(f"Ошибка при закрытии: {e}", reply_markup=main_menu())
     else:
-        update.message.reply_text("Пожалуйста, используйте кнопки для управления.", reply_markup=main_menu())
+        await update.message.reply_text("Пожалуйста, используйте кнопки для управления.", reply_markup=main_menu())
 
 def main():
-    updater = Updater(TOKEN, use_context=True)
-    dp = updater.dispatcher
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CallbackQueryHandler(button))
-    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    updater.start_polling()
-    updater.idle()
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
