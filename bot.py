@@ -1,450 +1,611 @@
-#!/usr/bin/env python3
 import logging
 import subprocess
-import difflib
-import os
+import asyncio
 import psutil
-import shutil
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import re
+import signal
+from wakeonlan import send_magic_packet
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply
+)
 from telegram.ext import (
-    Updater,
+    Application,
     CommandHandler,
+    ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
-    Filters,
-    ConversationHandler,
-    CallbackContext,
+    filters,
 )
-
-# Определяем состояния диалога
-MENU = 0
-SSH_CONFIG = 1
-PLAYER_SELECTION = 2
-MUSIC = 3
-MUSIC_VOLUME = 4
-APP = 5
-POWER = 6
-MAC_INPUT = 7
+from telegram.error import TelegramError
 
 # Настройка логирования
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# -------------------------
-# Вспомогательная функция для выполнения команд (локально или по SSH)
-# -------------------------
-def run_command(command: list, context: CallbackContext):
-    ssh_target = context.user_data.get("ssh_target")
-    if ssh_target:
-        # Выполнение команды на удалённом хосте через SSH
-        full_command = ["ssh", ssh_target] + command
-        return subprocess.run(full_command, capture_output=True, text=True)
-    else:
-        return subprocess.run(command, capture_output=True, text=True)
+# Идентификатор администратора (замените на ваш реальный ID)
+ADMIN_ID = 6061771975  # Замените на ваш Telegram ID
 
-# =========================
-# Функции для установки SSH подключения
-# =========================
-def set_ssh(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Введите SSH адрес в формате user@host (например, user@192.168.1.100):")
-    return SSH_CONFIG
+# Словарь для хранения текущего меню пользователя
+current_menu = {}
 
-def ssh_config(update: Update, context: CallbackContext) -> int:
-    ssh_target = update.message.text.strip()
-    context.user_data['ssh_target'] = ssh_target
-    update.message.reply_text(f"SSH подключение установлено: {ssh_target}")
-    return MENU
+# Пороговые значения для уведомлений
+CPU_LOAD_THRESHOLD = 85  # Процент нагрузки
+GPU_LOAD_THRESHOLD = 85  # Процент нагрузки (требует реализации)
+CPU_TEMP_THRESHOLD = 75  # Градусы Цельсия
+GPU_TEMP_THRESHOLD = 75  # Градусы Цельсия (требует реализации)
 
-# =========================
-# Функции для установки MAC адреса для Magic Packet
-# =========================
-def set_mac(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("Введите MAC адрес для отправки Magic Packet (формат: XX:XX:XX:XX:XX:XX):")
-    return MAC_INPUT
+# ==================== СЛУЖЕБНЫЕ ФУНКЦИИ ====================
 
-def mac_config(update: Update, context: CallbackContext) -> int:
-    mac_address = update.message.text.strip()
-    context.user_data['mac_address'] = mac_address
-    update.message.reply_text(f"MAC адрес установлен: {mac_address}")
-    return MENU
-
-# =========================
-# Функции для выбора плеера
-# =========================
-def get_active_players() -> list:
-    """
-    Получает список активных плееров через команду `playerctl -l`
-    """
+async def execute_command(command: list, success_msg: str, update: Update, menu: callable):
     try:
-        result = run_command(["playerctl", "-l"], context=CallbackContext({}))
-        players = result.stdout.strip().splitlines()
-        return [p.strip() for p in players if p.strip()]
-    except Exception as e:
-        logger.error(f"Ошибка получения списка плееров: {e}")
-        return []
-
-def select_player(update: Update, context: CallbackContext) -> int:
-    """
-    Отправляет пользователю список активных плееров для выбора
-    """
-    players = get_active_players()
-    if not players:
-        update.message.reply_text("Нет активных плееров.")
-        return MENU
-    keyboard = [[InlineKeyboardButton(p, callback_data=f"select_player:{p}")] for p in players]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Выберите плеер для управления музыкой:", reply_markup=reply_markup)
-    return PLAYER_SELECTION
-
-def select_player_callback(update: Update, context: CallbackContext) -> int:
-    """
-    Обрабатывает выбор плеера пользователем.
-    Сохраняет выбранный плеер в контексте и переходит в меню управления музыкой.
-    """
-    query = update.callback_query
-    query.answer()
-    player = query.data.split(":", 1)[1]
-    context.user_data['player'] = player
-    query.edit_message_text(f"Вы выбрали плеер: {player}")
-    return music_menu_by_player(update, context)
-
-def music_menu_by_player(update: Update, context: CallbackContext) -> int:
-    """
-    Отправляет пользователю меню управления музыкой для выбранного плеера.
-    Добавлена кнопка для смены плеера.
-    """
-    keyboard = [
-        [
-            InlineKeyboardButton("Следующий трек", callback_data='music_next'),
-            InlineKeyboardButton("Предыдущий трек", callback_data='music_prev')
-        ],
-        [InlineKeyboardButton("Пауза/Воспроизведение", callback_data='music_toggle')],
-        [InlineKeyboardButton("Актуальный трек", callback_data='music_current')],
-        [InlineKeyboardButton("Изменить громкость", callback_data='music_volume')],
-        [InlineKeyboardButton("Сменить плеер", callback_data='change_player')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.callback_query:
-        update.callback_query.edit_message_text(
-            "Управление музыкой для плеера: " + context.user_data.get('player', ''),
-            reply_markup=reply_markup
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-    else:
-        update.message.reply_text(
-            "Управление музыкой для плеера: " + context.user_data.get('player', ''),
-            reply_markup=reply_markup
-        )
-    return MUSIC
-
-# =========================
-# Функции управления музыкой через playerctl
-# =========================
-def music_callback(update: Update, context: CallbackContext) -> int:
-    """
-    Обрабатывает нажатия кнопок управления музыкой.
-    Выполняет команды для выбранного плеера с помощью playerctl.
-    """
-    query = update.callback_query
-    query.answer()
-    data = query.data
-
-    if data == 'change_player':
-        players = get_active_players()
-        if not players:
-            query.edit_message_text("Нет активных плееров для управления музыкой.")
-            return MENU
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"select_player:{p}")] for p in players]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        query.edit_message_text("Выберите плеер для управления музыкой:", reply_markup=reply_markup)
-        return PLAYER_SELECTION
-
-    player = context.user_data.get('player')
-    if not player:
-        query.edit_message_text("Плеер не выбран. Пожалуйста, выберите плеер.")
-        return PLAYER_SELECTION
-
-    if data == 'music_next':
-        command = ["playerctl", "-p", player, "next"]
-    elif data == 'music_prev':
-        command = ["playerctl", "-p", player, "previous"]
-    elif data == 'music_toggle':
-        command = ["playerctl", "-p", player, "play-pause"]
-    elif data == 'music_current':
-        command = ["playerctl", "-p", player, "metadata", "--format", "{{ artist }} - {{ title }}"]
-    elif data == 'music_volume':
-        query.edit_message_text("Введите желаемую громкость (от 1 до 100):")
-        return MUSIC_VOLUME
-    else:
-        query.edit_message_text("Неизвестное действие.")
-        return MUSIC
-
-    try:
-        result = run_command(command, context)
-        output = result.stdout.strip() or "Команда выполнена."
-        query.edit_message_text(output)
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            await send_response(update, f"✅ {success_msg}", menu)
+        else:
+            error_msg = stderr.decode().strip() if stderr else "Неизвестная ошибка"
+            logger.error(f"Ошибка команды {command}: {error_msg}")
+            await send_response(update, f"❌ Ошибка: {error_msg}", menu)
     except Exception as e:
-        logger.error(f"Ошибка при выполнении команды {' '.join(command)}: {e}")
-        query.edit_message_text("Ошибка при выполнении команды.")
-    return MUSIC
+        logger.error(f"Ошибка выполнения команды {command}: {e}")
+        await send_response(update, f"❌ Ошибка выполнения команды: {e}", menu)
 
-def music_volume(update: Update, context: CallbackContext) -> int:
-    """
-    Обрабатывает ввод значения громкости.
-    Переводит процентное значение в дробное (0-1) и устанавливает громкость для выбранного плеера.
-    """
-    player = context.user_data.get('player')
-    if not player:
-        update.message.reply_text("Плеер не выбран. Сначала выберите плеер.")
-        return PLAYER_SELECTION
+
+async def send_response(update: Update, text: str, menu: callable = None):
+    if not menu:
+        menu = current_menu.get(update.effective_user.id, main_menu)
     try:
-        volume_percent = int(update.message.text)
-        if not (1 <= volume_percent <= 100):
-            update.message.reply_text("Пожалуйста, введите число от 1 до 100.")
-            return MUSIC_VOLUME
-    except ValueError:
-        update.message.reply_text("Неверный ввод. Введите число от 1 до 100.")
-        return MUSIC_VOLUME
-
-    volume_fraction = volume_percent / 100.0
-    command = ["playerctl", "-p", player, "volume", str(volume_fraction)]
-    try:
-        result = run_command(command, context)
-        output = result.stdout.strip() or f"Громкость изменена на {volume_percent}%."
-        update.message.reply_text(output)
-    except Exception as e:
-        logger.error(f"Ошибка при выполнении команды {' '.join(command)}: {e}")
-        update.message.reply_text("Ошибка при выполнении команды.")
-    return MUSIC
-
-# =========================
-# Функция управления приложениями
-# =========================
-def app_control(update: Update, context: CallbackContext) -> int:
-    """
-    Открытие или закрытие приложений.
-    Ожидается ввод в формате: open <название> или close <название>
-    Теперь бот ищет приложение непосредственно в системе.
-    """
-    text = update.message.text.strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) != 2:
-        update.message.reply_text("Неверный формат. Используйте: open <название> или close <название>")
-        return APP
-
-    action, app_name = parts[0].lower(), parts[1].lower()
-
-    if action == "open":
-        if context.user_data.get("ssh_target"):
-            update.message.reply_text("Запуск приложений через SSH не поддерживается.")
-            return APP
-        executable = shutil.which(app_name)
-        if not executable:
-            update.message.reply_text("Приложение не найдено в системе.")
-            return APP
-        try:
-            subprocess.Popen([executable])
-            update.message.reply_text(f"Приложение {app_name} запущено.")
-        except Exception as e:
-            logger.error(f"Ошибка при запуске {app_name}: {e}")
-            update.message.reply_text(f"Ошибка при запуске {app_name}.")
-    elif action == "close":
-        try:
-            run_command(["pkill", "-f", app_name], context)
-            update.message.reply_text(f"Приложение {app_name} закрыто.")
-        except Exception as e:
-            logger.error(f"Ошибка при закрытии {app_name}: {e}")
-            update.message.reply_text(f"Ошибка при закрытии {app_name}.")
-    else:
-        update.message.reply_text("Неверное действие. Используйте open или close.")
-    return MENU
-
-# =========================
-# Функции управления питанием
-# =========================
-def power_menu(update: Update, context: CallbackContext) -> int:
-    """Показываем меню управления питанием ПК."""
-    keyboard = [
-        [InlineKeyboardButton("Выключение", callback_data='power_shutdown')],
-        [InlineKeyboardButton("Перезагрузка", callback_data='power_reboot')],
-        [InlineKeyboardButton("Отправка Magic Packet", callback_data='power_magic')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        update.message.reply_text("Выберите действие управления питанием:", reply_markup=reply_markup)
-    elif update.callback_query:
-        update.callback_query.edit_message_text("Выберите действие управления питанием:", reply_markup=reply_markup)
-    return POWER
-
-def power_callback(update: Update, context: CallbackContext) -> int:
-    """Обработка выбора в меню управления питанием."""
-    query = update.callback_query
-    query.answer()
-    data = query.data
-
-    if data == "power_shutdown":
-        try:
-            run_command(["shutdown", "now"], context)
-            query.edit_message_text("Система выключается...")
-        except Exception as e:
-            logger.error(f"Ошибка при выключении: {e}")
-            query.edit_message_text("Ошибка при выполнении выключения.")
-    elif data == "power_reboot":
-        try:
-            run_command(["reboot"], context)
-            query.edit_message_text("Система перезагружается...")
-        except Exception as e:
-            logger.error(f"Ошибка при перезагрузке: {e}")
-            query.edit_message_text("Ошибка при выполнении перезагрузки.")
-    elif data == "power_magic":
-        mac_address = context.user_data.get("mac_address")
-        if not mac_address:
-            query.edit_message_text("MAC адрес не установлен. Используйте команду /setmac для установки.")
-            return MENU
-        try:
-            run_command(["wakeonlan", mac_address], context)
-            query.edit_message_text("Magic Packet отправлен.")
-        except Exception as e:
-            logger.error(f"Ошибка при отправке Magic Packet: {e}")
-            query.edit_message_text("Ошибка при отправке Magic Packet.")
-    return MENU
-
-# =========================
-# Функция получения системной информации
-# =========================
-def system_info(update: Update, context: CallbackContext) -> int:
-    """Получение информации о системе: загрузка CPU, памяти и GPU."""
-    try:
-        cpu_usage = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory()
-        mem_usage = mem.percent
-
-        try:
-            gpu_proc = run_command(
-                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                context
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                text=text,
+                reply_markup=menu() if menu else None
             )
-            gpu_usage = gpu_proc.stdout.strip() + "%" if gpu_proc.stdout.strip() else "N/A"
-        except Exception:
-            gpu_usage = "N/A"
+        elif update.message:
+            await update.message.reply_text(text, reply_markup=menu() if menu else None)
+        else:
+            logger.warning("Нет доступного поля для отправки сообщения.")
+    except TelegramError as e:
+        logger.error(f"Ошибка отправки сообщения: {e}")
 
-        info = (
-            f"Информация о системе:\n"
-            f"CPU: {cpu_usage}%\n"
-            f"Память: {mem_usage}%\n"
-            f"GPU: {gpu_usage}"
+
+def find_app_executable(app_name: str):
+    try:
+        # Поиск с помощью which
+        result = subprocess.run(
+            ["which", app_name],
+            capture_output=True,
+            text=True
         )
-        update.message.reply_text(info)
+        return result.stdout.strip() if result.returncode == 0 else None
     except Exception as e:
-        logger.error(f"Ошибка при получении системной информации: {e}")
-        update.message.reply_text("Ошибка при получении информации о системе.")
-    return MENU
+        logger.error(f"Ошибка поиска приложения '{app_name}': {e}")
+        return None
 
-# =========================
-# Главное меню
-# =========================
-def start(update: Update, context: CallbackContext) -> int:
-    """Обработчик команды /start. Показывает главное меню."""
-    keyboard = [
-        [InlineKeyboardButton("Управление музыкой", callback_data='menu_music')],
-        [InlineKeyboardButton("Управление приложениями", callback_data='menu_app')],
-        [InlineKeyboardButton("Управление питанием", callback_data='menu_power')],
-        [InlineKeyboardButton("Системная информация", callback_data='menu_sysinfo')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Главное меню:", reply_markup=reply_markup)
-    return MENU
 
-def menu_callback(update: Update, context: CallbackContext) -> int:
-    """Обработка нажатий в главном меню."""
+async def manage_app_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await manage_app(update, context, "start")
+
+
+async def manage_app_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await manage_app(update, context, "stop")
+
+
+async def manage_app(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        if update.message:
+            await update.message.reply_text("⛔ Доступ запрещен!")
+        return
+    try:
+        if not context.args:
+            await send_response(update, "❌ Укажите название приложения!", apps_menu)
+            return
+
+        app_name = " ".join(context.args).strip()
+
+        # Проверка наличия приложения
+        app_path = find_app_executable(app_name)
+        if not app_path:
+            await send_response(update, f"❌ Приложение '{app_name}' не найдено.", apps_menu)
+            return
+
+        # Получение текущего DISPLAY и XAUTHORITY
+        display = os.environ.get('DISPLAY', ':0')
+        xauth = os.environ.get('XAUTHORITY', f"/home/{os.environ.get('USER')}/.Xauthority")
+
+        env = dict(os.environ, DISPLAY=display, XAUTHORITY=xauth)
+
+        if action == "start":
+            try:
+                # Запуск приложения в новом сеансе
+                proc = await asyncio.create_subprocess_exec(
+                    app_path,
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True
+                )
+                await send_response(update, f"✅ Запускаю '{app_name}'...", apps_menu)
+            except Exception as e:
+                logger.error(f"Ошибка запуска приложения '{app_name}': {e}")
+                await send_response(update, f"❌ Ошибка запуска: {e}", apps_menu)
+
+        elif action == "stop":
+            try:
+                # Подтверждение от пользователя
+                await send_response(
+                    update,
+                    f"⚠️ Вы уверены, что хотите завершить все процессы '{app_name}'?\nОтветьте 'yes' или 'no'.",
+                    None
+                )
+                context.user_data['pending_kill'] = {
+                    'app_name': app_name,
+                    'menu': apps_menu
+                }
+            except Exception as e:
+                logger.error(f"Ошибка подготовки к остановке приложения '{app_name}': {e}")
+                await send_response(update, f"❌ Ошибка: {e}", apps_menu)
+
+    except Exception as e:
+        logger.error(f"Ошибка управления приложением: {e}")
+        await send_response(update, f"❌ Ошибка: {e}", apps_menu)
+
+
+async def confirm_kill_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_response = update.message.text.lower()
+    pending = context.user_data.get('pending_kill')
+    if pending and user_response in ['yes', 'да', 'y', 'д']:
+        app_name = pending['app_name']
+        try:
+            # Завершение процессов приложения
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", app_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await proc.wait()
+            if proc.returncode == 0:
+                await send_response(update, f"✅ Завершены все процессы '{app_name}'.", apps_menu)
+            else:
+                stderr = await proc.stderr.read()
+                error_msg = stderr.decode().strip() if stderr else "Не удалось завершить процессы."
+                await send_response(update, f"❌ Ошибка остановки: {error_msg}", apps_menu)
+        except Exception as e:
+            logger.error(f"Ошибка остановки приложения '{app_name}': {e}")
+            await send_response(update, f"❌ Ошибка остановки: {e}", apps_menu)
+        context.user_data['pending_kill'] = None
+    else:
+        await send_response(update, "🚫 Действие отменено.", pending['menu'])
+        context.user_data['pending_kill'] = None
+
+
+# ==================== МЕНЮ И КЛАВИАТУРЫ ====================
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 Управление музыкой", callback_data="music_menu")],
+        [InlineKeyboardButton("📦 Управление приложениями", callback_data="apps_menu")],
+        [InlineKeyboardButton("🔌 Управление питанием", callback_data="power_menu")],
+        [InlineKeyboardButton("⚙️ Системные функции", callback_data="system_menu")]
+    ])
+
+
+def music_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ Воспроизвести", callback_data="music_play"),
+         InlineKeyboardButton("⏸ Пауза", callback_data="music_pause")],
+        [InlineKeyboardButton("⏭ Следующий", callback_data="music_next"),
+         InlineKeyboardButton("⏮ Предыдущий", callback_data="music_previous")],
+        [InlineKeyboardButton("🎵 Текущая песня", callback_data="music_current")],
+        [InlineKeyboardButton("🔄 Выбрать плеер", callback_data="music_choose_player")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ])
+
+
+def apps_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Запустить приложение", callback_data="app_start")],
+        [InlineKeyboardButton("📝 Остановить приложение", callback_data="app_stop")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ])
+
+
+def power_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Перезагрузка", callback_data="power_reboot")],
+        [InlineKeyboardButton("⏻ Выключение", callback_data="power_shutdown")],
+        [InlineKeyboardButton("🌙 Спящий режим", callback_data="power_suspend")],
+        [InlineKeyboardButton("💻 Включить ПК (WoL)", callback_data="power_wakeonlan")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ])
+
+
+def system_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика системы", callback_data="sys_info")],
+        [InlineKeyboardButton("🔊 Установить громкость", callback_data="sys_vol_set")],
+        [InlineKeyboardButton("🔇 Переключить звук", callback_data="sys_vol_mute")],
+        [InlineKeyboardButton("⚠️ Уведомления о нагрузке и температуре", callback_data="sys_alerts")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+    ])
+
+
+# ==================== ОБРАБОТЧИКИ СОБЫТИЙ ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    logger.info(f"Попытка входа: ID={user_id}, Ожидаемый ID={ADMIN_ID}")
+
+    if user_id != ADMIN_ID:
+        if update.message:
+            await update.message.reply_text(f"⛔ Доступ запрещен! Ваш ID: {user_id}")
+        return
+
+    current_menu[user_id] = main_menu
+    if update.message:
+        await update.message.reply_text(
+            "🤖 Бот для управления компьютером\nВыберите раздел:",
+            reply_markup=main_menu()
+        )
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    query.answer()
+    if not query:
+        logger.warning("Нет callback_query в обновлении.")
+        return
+
+    await query.answer()
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_ID:
+        await query.edit_message_text("⛔ Доступ запрещен!")
+        return
+
     data = query.data
 
-    if data == 'menu_music':
-        players = get_active_players()
+    if data == "main_menu":
+        current_menu[user_id] = main_menu
+        await query.edit_message_text("Главное меню:", reply_markup=main_menu())
+        return
+
+    menus = {
+        "music_menu": (music_menu, "Управление музыкой"),
+        "apps_menu": (apps_menu, "Управление приложениями"),
+        "power_menu": (power_menu, "Управление питанием"),
+        "system_menu": (system_menu, "Системные функции")
+    }
+
+    if data in menus:
+        menu_func, title = menus[data]
+        current_menu[user_id] = menu_func
+        await query.edit_message_text(f"🔧 {title}:", reply_markup=menu_func())
+        return
+
+    try:
+        await query.edit_message_text("🔄 Обработка...", reply_markup=None)
+
+        if data.startswith("music_"):
+            action = data.split("_", 1)[1]
+            await handle_music_action(update, context, action)
+
+        elif data.startswith("power_"):
+            await handle_power_action(update, context, data)
+
+        elif data.startswith("sys_"):
+            await handle_system_action(update, context, data)
+
+        elif data == "app_start":
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Введите команду в формате /start_app <имя_приложения>",
+                reply_markup=ForceReply(selective=True)
+            )
+        elif data == "app_stop":
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Введите команду в формате /stop_app <имя_приложения>",
+                reply_markup=ForceReply(selective=True)
+            )
+        else:
+            await send_response(update, "❌ Неизвестная команда.", main_menu)
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки кнопки: {e}")
+        await send_response(update, f"❌ Ошибка выполнения: {e}", main_menu)
+
+
+async def handle_music_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    try:
+        # Проверка наличия playerctl
+        result = subprocess.run(["which", "playerctl"], capture_output=True)
+        if result.returncode != 0:
+            await send_response(update, "❌ Утилита 'playerctl' не установлена.", music_menu)
+            return
+
+        # Получение списка плееров
+        players_output = subprocess.check_output(["playerctl", "-l"], text=True)
+        all_players = players_output.strip().split('\n')
+
+        # Фильтрация плееров: исключаем 'mpv', выбираем 'chromium.instance'
+        players = [
+            player for player in all_players
+            if player and player != 'mpv' and player.startswith('chromium.instance')
+        ]
+
         if not players:
-            query.edit_message_text("Нет активных плееров для управления музыкой.")
-            return MENU
-        keyboard = [[InlineKeyboardButton(p, callback_data=f"select_player:{p}")] for p in players]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        query.edit_message_text("Выберите плеер для управления музыкой:", reply_markup=reply_markup)
-        return PLAYER_SELECTION
-    elif data == 'menu_app':
-        query.edit_message_text("Введите команду для управления приложениями (например: open firefox или close vlc):")
-        return APP
-    elif data == 'menu_power':
-        return power_menu(update, context)
-    elif data == 'menu_sysinfo':
-        return system_info(update, context)
+            await send_response(update, "❌ Нет доступных плееров.", music_menu)
+            return
+
+        # Проверяем, выбран ли плеер пользователем
+        selected_player = context.user_data.get('selected_player')
+
+        if action == "choose_player":
+            # Предлагаем выбрать плеер
+            buttons = [
+                [InlineKeyboardButton(player, callback_data=f"select_player_{player}")]
+                for player in players
+            ]
+            buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="music_menu")])
+            reply_markup = InlineKeyboardMarkup(buttons)
+            await send_response(update, "Выберите плеер:", lambda: reply_markup)
+            return
+
+        elif action.startswith("select_player_"):
+            # Пользователь выбрал плеер
+            selected_player = action.replace("select_player_", "")
+            context.user_data['selected_player'] = selected_player
+            await send_response(update, f"🎵 Выбран плеер: {selected_player}", music_menu)
+            return
+
+        if not selected_player or selected_player not in players:
+            # Если плеер не выбран или недоступен, предлагаем выбрать
+            context.user_data['selected_player'] = None
+            # Если один плеер, выбираем его автоматически
+            if len(players) == 1:
+                selected_player = players[0]
+                context.user_data['selected_player'] = selected_player
+            else:
+                # Предлагаем выбрать плеер
+                buttons = [
+                    [InlineKeyboardButton(player, callback_data=f"select_player_{player}")]
+                    for player in players
+                ]
+                buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="music_menu")])
+                reply_markup = InlineKeyboardMarkup(buttons)
+                await send_response(update, "Выберите плеер:", lambda: reply_markup)
+                return
+
+        if action == "current":
+            # Получение информации о текущей песне
+            proc = await asyncio.create_subprocess_exec(
+                "playerctl", "-p", selected_player, "metadata", "--format", "{{ artist }} - {{ title }}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await proc.communicate()
+            song_info = stdout.decode().strip()
+            if song_info:
+                await send_response(update, f"🎶 Сейчас играет: {song_info}", music_menu)
+                return
+            else:
+                await send_response(update, "❌ Не удалось получить информацию о текущей песне.", music_menu)
+        else:
+            # Управление воспроизведением
+            proc = await asyncio.create_subprocess_exec(
+                "playerctl", "-p", selected_player, action,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+            await send_response(update, f"🎵 Команда '{action}' выполнена для плеера '{selected_player}'.", music_menu)
+    except Exception as e:
+        logger.error(f"Ошибка управления музыкой: {e}")
+        await send_response(update, f"❌ Ошибка: {e}", music_menu)
+
+
+async def handle_power_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    commands = {
+        "power_reboot": ["sudo", "/sbin/reboot"],
+        "power_shutdown": ["sudo", "/sbin/shutdown", "now"],
+        "power_suspend": ["systemctl", "suspend"]
+    }
+
+    if action == "power_wakeonlan":
+        await send_wakeonlan(update, context)
+        return
+
+    command = commands.get(action)
+    if not command:
+        await send_response(update, "❌ Неизвестная команда питания.", power_menu)
+        return
+
+    # Подтверждение от пользователя
+    await send_response(
+        update,
+        f"⚠️ Вы уверены, что хотите выполнить '{action}'?\nОтветьте 'yes' или 'no'.",
+        None
+    )
+
+    # Сохранение ожидаемой команды для подтверждения
+    context.user_data['pending_command'] = {
+        'command': command,
+        'menu': power_menu
+    }
+
+
+async def confirm_power_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_response = update.message.text.lower()
+    pending = context.user_data.get('pending_command')
+    if pending and user_response in ['yes', 'да', 'y', 'д']:
+        await execute_command(pending['command'], "Команда выполнена.", update, pending['menu'])
+        context.user_data['pending_command'] = None
     else:
-        query.edit_message_text("Неизвестное действие.")
-        return MENU
+        await send_response(update, "🚫 Действие отменено.", pending['menu'])
+        context.user_data['pending_command'] = None
 
-# =========================
-# Основная функция
-# =========================
+
+async def handle_system_action(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    if action == "sys_info":
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory().percent
+        await send_response(update, f"📊 Статистика:\nCPU: {cpu}%\nRAM: {mem}%", system_menu)
+    elif action == "sys_vol_mute":
+        await execute_command(
+            ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+            "🔇 Звук переключен.",
+            update,
+            system_menu
+        )
+    elif action == "sys_vol_set":
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Введите уровень громкости (0-150):",
+            reply_markup=ForceReply(selective=True)
+        )
+    elif action == "sys_alerts":
+        # Запуск мониторинга системы
+        if not context.job_queue.get_jobs_by_name('system_monitor'):
+            context.job_queue.run_repeating(
+                monitor_system,
+                interval=60,
+                first=0,
+                chat_id=update.effective_chat.id,
+                name='system_monitor'
+            )
+            await send_response(update, "📡 Мониторинг системы запущен. Вы будете получать уведомления о высокой нагрузке и температуре.", system_menu)
+        else:
+            # Остановка мониторинга
+            jobs = context.job_queue.get_jobs_by_name('system_monitor')
+            for job in jobs:
+                job.schedule_removal()
+            await send_response(update, "📡 Мониторинг системы остановлен.", system_menu)
+
+
+async def set_volume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        if update.message:
+            await update.message.reply_text("⛔ Доступ запрещен!")
+        return
+    try:
+        volume = int(update.message.text)
+        if 0 <= volume <= 150:
+            await execute_command(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{volume}%"],
+                f"🔊 Громкость установлена на {volume}%.",
+                update,
+                system_menu
+            )
+        else:
+            await send_response(update, "❌ Укажите значение от 0 до 150.", system_menu)
+    except ValueError:
+        await send_response(update, "❌ Неверный формат числа.", system_menu)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        if update.message:
+            await update.message.reply_text("⛔ Доступ запрещен!")
+        return
+    text = update.message.text.strip().lower()
+    pending_kill = context.user_data.get('pending_kill')
+    pending_power = context.user_data.get('pending_command')
+
+    if pending_kill:
+        # Обработка подтверждения завершения приложения
+        await confirm_kill_app(update, context)
+    elif pending_power:
+        # Обработка подтверждения действия питания
+        await confirm_power_action(update, context)
+    else:
+        if text.startswith('/start_app'):
+            await manage_app_start(update, context)
+        elif text.startswith('/stop_app'):
+            await manage_app_stop(update, context)
+        elif re.match(r'^\d+$', text):
+            # Обработка установки громкости
+            await set_volume(update, context)
+        else:
+            if update.message:
+                await update.message.reply_text("❌ Неизвестная команда.")
+
+
+async def monitor_system(context: ContextTypes.DEFAULT_TYPE):
+    # Проверка нагрузки CPU
+    cpu_load = psutil.cpu_percent(interval=1)
+    if cpu_load > CPU_LOAD_THRESHOLD:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ Высокая нагрузка CPU: {cpu_load}%"
+        )
+
+    # Проверка температуры CPU
+    try:
+        temps = psutil.sensors_temperatures()
+        if 'coretemp' in temps:
+            cpu_temp = max([t.current for t in temps['coretemp']])
+            if cpu_temp > CPU_TEMP_THRESHOLD:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"🌡️ Высокая температура CPU: {cpu_temp}°C"
+                )
+    except AttributeError:
+        logger.warning("Сбор данных о температуре не поддерживается на этой платформе.")
+
+    # Проверка нагрузки и температуры GPU (требует дополнительной реализации для конкретного оборудования)
+
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    error = context.error
+    logger.error(f"Ошибка: {error}")
+    if update:
+        await send_response(update, f"⚠️ Произошла ошибка: {error}", None)
+
+
+async def send_wakeonlan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Замените на MAC-адрес вашего целевого компьютера
+    TARGET_MAC_ADDRESS = "b0:6e:bf:c8:3e:ba"  # Укажите ваш MAC-адрес
+
+    try:
+        send_magic_packet(TARGET_MAC_ADDRESS)
+        await send_response(update, f"💡 Magic packet отправлен на {TARGET_MAC_ADDRESS}. Попытка включить ПК.", power_menu)
+    except Exception as e:
+        logger.error(f"Ошибка отправки magic packet: {e}")
+        await send_response(update, f"❌ Ошибка отправки magic packet: {e}", power_menu)
+
+
 def main():
-    # Если переменная окружения не задана, запрашиваем токен в консоли
-    TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        TOKEN = input("Введите токен Telegram бота: ").strip()
+    # Создание экземпляра приложения
+    application = Application.builder().token("8137824543:AAGKP32Rjj_ctA5horpEVoKOezJSBNhsRfg").build()
 
-    updater = Updater(TOKEN)
-    dispatcher = updater.dispatcher
+    # Регистрация обработчиков команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start_app", manage_app_start))
+    application.add_handler(CommandHandler("stop_app", manage_app_stop))
 
-    # Основной ConversationHandler
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MENU: [
-                CallbackQueryHandler(menu_callback, pattern="^menu_")
-            ],
-            PLAYER_SELECTION: [
-                CallbackQueryHandler(select_player_callback, pattern="^select_player:")
-            ],
-            MUSIC: [
-                CallbackQueryHandler(music_callback, pattern="^(music_|change_player)")
-            ],
-            MUSIC_VOLUME: [
-                MessageHandler(Filters.text & ~Filters.command, music_volume)
-            ],
-            APP: [
-                MessageHandler(Filters.text & ~Filters.command, app_control)
-            ],
-            POWER: [
-                CallbackQueryHandler(power_callback, pattern="^power_")
-            ],
-        },
-        fallbacks=[CommandHandler("start", start)]
-    )
+    # Регистрация обработчиков сообщений и колбэков
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    dispatcher.add_handler(conv_handler)
+    # Глобальный обработчик ошибок
+    application.add_error_handler(error_handler)
 
-    # Отдельные ConversationHandler для настройки SSH и MAC адреса
-    ssh_handler = ConversationHandler(
-        entry_points=[CommandHandler("setssh", set_ssh)],
-        states={
-            SSH_CONFIG: [MessageHandler(Filters.text & ~Filters.command, ssh_config)]
-        },
-        fallbacks=[CommandHandler("cancel", start)]
-    )
-    dispatcher.add_handler(ssh_handler)
+    # Запуск бота
+    application.run_polling()
 
-    mac_handler = ConversationHandler(
-        entry_points=[CommandHandler("setmac", set_mac)],
-        states={
-            MAC_INPUT: [MessageHandler(Filters.text & ~Filters.command, mac_config)]
-        },
-        fallbacks=[CommandHandler("cancel", start)]
-    )
-    dispatcher.add_handler(mac_handler)
-
-    updater.start_polling()
-    logger.info("Бот запущен.")
-    updater.idle()
 
 if __name__ == "__main__":
     main()
