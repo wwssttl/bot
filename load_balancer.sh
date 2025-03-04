@@ -89,4 +89,46 @@ while true; do
     log_info "Загрузка CPU: ${cpu}%"
     log_info "Загрузка RAM: ${mem}%"
 
-    # Если хотя бы одно значение пр
+    # Если хотя бы одно значение превышает порог
+    if [ "$cpu" -gt "$LOAD_THRESHOLD" ] || [ "$mem" -gt "$LOAD_THRESHOLD" ]; then
+        # Фиксируем время начала высокой нагрузки, если оно еще не установлено
+        if [ "$high_load_start" -eq 0 ]; then
+            high_load_start=$(date +%s)
+            log_info "Начало высокой нагрузки зафиксировано."
+        else
+            current_time=$(date +%s)
+            duration=$(( current_time - high_load_start ))
+            log_info "Высокая нагрузка длится ${duration} секунд."
+            # Если нагрузка длится дольше порога, дополнительно проверяем, все ли еще высокая
+            if [ "$duration" -ge "$HIGH_LOAD_DURATION_THRESHOLD" ]; then
+                # Дополнительная проверка текущей нагрузки
+                cpu_current=$(get_cpu_usage)
+                mem_current=$(get_mem_usage)
+                if [ "$cpu_current" -gt "$LOAD_THRESHOLD" ] || [ "$mem_current" -gt "$LOAD_THRESHOLD" ]; then
+                    log_info "Высокая нагрузка более ${HIGH_LOAD_DURATION_THRESHOLD} секунд и сохраняется."
+                    offload_task_to_pc &
+                    perform_task &
+                    wait
+                    log_info "Задача завершена с распределением нагрузки."
+                else
+                    log_info "Нагрузка снизилась до порогового значения, offload не требуется."
+                    log_info "Нормальная загрузка, задача выполняется на сервере."
+                    perform_task
+                fi
+                # Сброс таймера после выполнения
+                high_load_start=0
+            fi
+        fi
+    else
+        # Если нагрузка нормальная – сбрасываем таймер, если он был установлен
+        if [ "$high_load_start" -ne 0 ]; then
+            log_info "Нагрузка нормализовалась, сброс таймера высокой нагрузки."
+            high_load_start=0
+        fi
+        log_info "Нормальная загрузка, задача выполняется на сервере."
+        perform_task
+    fi
+
+    log_info "Ожидание ${CHECK_INTERVAL} секунд до следующей проверки..."
+    sleep "$CHECK_INTERVAL"
+done
