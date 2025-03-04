@@ -24,8 +24,15 @@ function log_error() {
 
 # Функция проверки доступности ПК через SSH
 function is_pc_online() {
+    log_info "Проверка доступности ПК: $MY_PC"
     ssh -o ConnectTimeout=5 "$MY_PC" "echo online" &>/dev/null
-    return $?
+    result=$?
+    if [ $result -eq 0 ]; then
+        log_info "ПК $MY_PC доступен."
+    else
+        log_error "ПК $MY_PC недоступен (код ошибки: $result)."
+    fi
+    return $result
 }
 
 # Функция для получения текущей загрузки CPU (в процентах)
@@ -60,13 +67,18 @@ function perform_task() {
 
 # Функция для передачи части задачи на основной ПК с уведомлением и расширенным логированием
 function offload_task_to_pc() {
-    log_info "Передача части задачи на ПК: $MY_PC"
-    remote_output=$(ssh "$MY_PC" "bash -c 'DISPLAY=:0 notify-send \"Задача распределена\" \"Сервер распределил часть задачи на ваш ПК\" && echo Выполняется задача на удалённом ПК (\$(uname -n)); sleep 5'" 2>&1)
-    exit_status=$?
-    if [ $exit_status -eq 0 ]; then
-        log_info "Удалённая задача выполнена успешно. Вывод: $remote_output"
+    log_info "Начало процедуры offload: попытка передать задачу на ПК $MY_PC"
+    if is_pc_online; then
+        log_info "Отправка задачи на ПК $MY_PC..."
+        remote_output=$(ssh "$MY_PC" "bash -c 'DISPLAY=:0 notify-send \"Задача распределена\" \"Сервер распределил часть задачи на ваш ПК\" && echo Выполняется задача на удалённом ПК (\$(uname -n)); sleep 5'" 2>&1)
+        exit_status=$?
+        if [ $exit_status -eq 0 ]; then
+            log_info "Удалённая задача выполнена успешно. Вывод: $remote_output"
+        else
+            log_error "Ошибка при выполнении задачи на удалённом ПК. Код ошибки: $exit_status. Вывод: $remote_output"
+        fi
     else
-        log_error "Ошибка при выполнении задачи на удалённом ПК. Код ошибки: $exit_status. Вывод: $remote_output"
+        log_error "Передача offload не выполнена, так как ПК недоступен."
     fi
 }
 
@@ -77,53 +89,4 @@ while true; do
     log_info "Загрузка CPU: ${cpu}%"
     log_info "Загрузка RAM: ${mem}%"
 
-    # Если хотя бы одно значение превышает порог
-    if [ "$cpu" -gt "$LOAD_THRESHOLD" ] || [ "$mem" -gt "$LOAD_THRESHOLD" ]; then
-        # Фиксируем время начала высокой нагрузки, если оно еще не установлено
-        if [ "$high_load_start" -eq 0 ]; then
-            high_load_start=$(date +%s)
-            log_info "Начало высокой нагрузки зафиксировано."
-        else
-            current_time=$(date +%s)
-            duration=$(( current_time - high_load_start ))
-            log_info "Высокая нагрузка длится ${duration} секунд."
-            # Если нагрузка длится дольше порога, дополнительно проверяем, все ли еще высокая
-            if [ "$duration" -ge "$HIGH_LOAD_DURATION_THRESHOLD" ]; then
-                # Дополнительная проверка текущей нагрузки
-                cpu_current=$(get_cpu_usage)
-                mem_current=$(get_mem_usage)
-                if [ "$cpu_current" -gt "$LOAD_THRESHOLD" ] || [ "$mem_current" -gt "$LOAD_THRESHOLD" ]; then
-                    log_info "Высокая нагрузка более ${HIGH_LOAD_DURATION_THRESHOLD} секунд и сохраняется."
-                    if is_pc_online; then
-                        log_info "ПК доступен, выполняем распределение задачи..."
-                        perform_task &
-                        offload_task_to_pc &
-                        wait
-                        log_info "Задача завершена с распределением нагрузки."
-                    else
-                        log_error "ПК не доступен, выполняем задачу целиком на сервере."
-                        perform_task
-                    fi
-                    # Сброс таймера после распределения
-                    high_load_start=0
-                else
-                    log_info "Нагрузка снизилась до порогового значения, не переключаем задачу."
-                    high_load_start=0
-                    log_info "Нормальная загрузка, задача выполняется на сервере."
-                    perform_task
-                fi
-            fi
-        fi
-    else
-        # Если нагрузка нормальная – сбрасываем таймер, если он был установлен
-        if [ "$high_load_start" -ne 0 ]; then
-            log_info "Нагрузка нормализовалась, сброс таймера высокой нагрузки."
-            high_load_start=0
-        fi
-        log_info "Нормальная загрузка, задача выполняется на сервере."
-        perform_task
-    fi
-
-    log_info "Ожидание ${CHECK_INTERVAL} секунд до следующей проверки..."
-    sleep "$CHECK_INTERVAL"
-done
+    # Если хотя бы одно значение пр
