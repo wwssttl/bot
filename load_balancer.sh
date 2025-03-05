@@ -103,4 +103,4 @@ while true; do
             fi
         fi
     else
-        [[ $high_load_start -ne 0 ]] && log_info "Нагрузка нормализована
+        [[ $high_load_start -ne 0 ]] && log_info "Нагрузка нормализована"
